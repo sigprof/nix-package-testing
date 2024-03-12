@@ -1,0 +1,155 @@
+name: Build packages from a Nixpkgs branch
+on:
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: 'Source repository (owner/repo)'
+        required: true
+        default: 'sigprof/nixpkgs'
+        type: string
+      source_branch:
+        description: 'Source branch'
+        required: true
+        type: string
+      target_branch:
+        description: 'Nixpkgs target branch'
+        required: true
+        default: 'master'
+        type: choice
+        options:
+          - master
+          - staging
+          - release-23.11
+          - staging-23.11
+      packages:
+        description: 'Packages to build'
+        required: true
+        type: string
+      systems:
+        description: 'Systems to build the packages for'
+        required: true
+        default: 'x86_64-linux'
+        type: string
+      cachix_mode:
+        description: 'Cachix usage'
+        required: true
+        default: 'none'
+        type: choice
+        options:
+          - none
+          - read-only
+          - read-write
+
+jobs:
+  # The `setup` job determines the matrix for the real build job.
+  setup:
+    name: Setup
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.result }}
+    steps:
+      - id: matrix
+        name: Determine build matrix
+        uses: actions/github-script@v7.0.1
+        with:
+          script: |
+            const payload = context.payload;
+            const inputs = payload && payload.inputs;
+            const systemsStr = inputs && inputs.systems && inputs.systems.trim();
+            if (!systemsStr) {
+              core.setFailed("The `systems` input is required");
+              return null;
+            }
+            const packagesStr = inputs && inputs.packages && inputs.packages.trim();
+            if (!packagesStr) {
+              core.setFailed("The `packages` input is required");
+              return null;
+            }
+            const systemToRunsOn = {
+              "x86_64-linux": "ubuntu-latest",
+              "x86_64-darwin": "macos-12",
+              "aarch64-darwin": "macos-14",
+            };
+            let systems = [];
+            for (const s of systemsStr.split(/\s+/)) {
+              if (s in systemToRunsOn) {
+                systems.push({
+                  "nixSystem": s,
+                  "runsOn": systemToRunsOn[s],
+                });
+              } else {
+                core.setFailed(`The system value '${s}' is invalid`);
+                return null;
+              }
+            }
+            const packages = packagesStr.split(/\s+/);
+            const matrix = {
+              "system": systems,
+              "package": packages,
+            };
+            core.startGroup("Job matrix:");
+            core.info(JSON.stringify(matrix, null, 2));
+            core.endGroup();
+            return matrix;
+
+  build:
+    name: Build ${{matrix.package}} on ${{matrix.system.nixSystem}}
+    needs: setup
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
+    runs-on: ${{ matrix.system.runsOn }}
+    steps:
+      - name: Checkout the upstream branch
+        uses: actions/checkout@v4.1.1
+        with:
+          repository: NixOS/nixpkgs
+          ref: ${{ inputs.target_branch }}
+          fetch-depth: 0
+
+      - name: Merge the source branch into the working area
+        run: |
+          git pull --no-rebase "$GITHUB_SERVER_URL/${{ inputs.source_repo }}" ${{ inputs.source_branch }}
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v26
+        with:
+          # `nix-shell` gets `bashInteractive` from `<nixpkgs>`, so a valid
+          # `NIX_PATH` is required (there is a fallback to whatever `bash`
+          # binary is found in `$PATH`, but it might be a wrong version).
+          nix_path: nixpkgs=channel:nixos-unstable
+
+      - name: Setup Cachix
+        uses: cachix/cachix-action@v14
+        if: ${{ inputs.cachix_mode != 'none' }}
+        with:
+          name: ${{ vars.CACHIX_NAME }}
+          authToken: ${{ (inputs.cachix_mode == 'read-write') && secrets.CACHIX_AUTH_TOKEN }}
+
+      - name: Build the package
+        run: |
+          nix build --show-trace --json ".#${{ matrix.package }}"
+
+      - name: Save build logs
+        if: always()
+        run: |
+          mkdir -p .build/logs
+          ( cd /nix/var/log/nix/drvs && find . -type f; ) |
+            while read log_src; do
+              log_src="${log_src##./}"
+              log_dst="${log_src//\//}"
+              log_dst="${log_dst//[\\\":<>|*?]/_}"
+              printf '%s\n' "$log_dst"
+              cp /nix/var/log/nix/drvs/"$log_src" .build/logs/"$log_dst" || touch .build/logs_fail
+            done
+          if [ -f .build/logs_fail ]; then
+            echo "*** Warning: Some log files could not be copied" 1>&2
+          fi
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4.3.1
+        with:
+          name: build-logs-${{matrix.system.nixSystem}}-${{matrix.package}}
+          path: ".build/logs/*"
+          if-no-files-found: ignore
